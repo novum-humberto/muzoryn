@@ -137,7 +137,7 @@ El instalador automático está diseñado para **Linux**. En macOS puedes intent
 ### Paso 1 · Descarga el proyecto
 
 ```bash
-git clone https://github.com/TU-USUARIO/muzoryn.git
+git clone https://github.com/novum-humberto/muzoryn.git
 cd muzoryn
 ```
 
