@@ -141,7 +141,7 @@ git clone https://github.com/novum-humberto/muzoryn.git
 cd muzoryn
 ```
 
-> 🔁 Cambia `TU-USUARIO` por tu usuario real de GitHub. ¿Sin `git`? Pulsa el botón verde **Code → Download ZIP**, descomprime y entra en la carpeta.
+> ¿Prefieres no usar Git? Pulsa el botón verde **Code → Download ZIP**, descomprime el archivo y entra en la carpeta `muzoryn`.
 
 ### Paso 2 · Elige tu método
 
