@@ -1,0 +1,31 @@
+schema_version = 1
+name = "Matrix"
+
+[palette]
+base = "#000A02"
+panel = "#031208"
+text = "#B6FFC8"
+muted = "#4FA866"
+border = "#0F4D22"
+cyan = "#00FF41"
+violet = "#00C853"
+pink = "#B8FF3C"
+amber = "#E6FF5C"
+red = "#FF4D4D"
+green = "#00FF41"
+
+[semantic]
+"surface.base" = "$base"
+"surface.panel" = "$panel"
+"text.primary" = "$text"
+"text.secondary" = "$muted"
+"border.normal" = "$border"
+"border.focused" = "$cyan"
+"selection.foreground" = "$base"
+"selection.background" = "@border.focused"
+"playback.active" = "$amber"
+"status.error" = "$red"
+"status.ok" = "$green"
+"progress.elapsed" = "@border.focused"
+"accent.secondary" = "$violet"
+"accent.tertiary" = "$pink"

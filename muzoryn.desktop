@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=MUZORYN
+GenericName=Reproductor musical
+Comment=Reproductor musical en terminal
+Exec=muzoryn
+Icon=muzoryn
+Terminal=true
+Categories=AudioVideo;Audio;Player;
+StartupNotify=false

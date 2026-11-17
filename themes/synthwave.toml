@@ -1,0 +1,31 @@
+schema_version = 1
+name = "Synthwave"
+
+[palette]
+base = "#120A24"
+panel = "#1C1038"
+text = "#F6E8FF"
+muted = "#A58BD0"
+border = "#42266E"
+cyan = "#FF71CE"
+violet = "#B967FF"
+pink = "#01CDFE"
+amber = "#FFFB96"
+red = "#FF4F79"
+green = "#05FFA1"
+
+[semantic]
+"surface.base" = "$base"
+"surface.panel" = "$panel"
+"text.primary" = "$text"
+"text.secondary" = "$muted"
+"border.normal" = "$border"
+"border.focused" = "$cyan"
+"selection.foreground" = "$base"
+"selection.background" = "@border.focused"
+"playback.active" = "$amber"
+"status.error" = "$red"
+"status.ok" = "$green"
+"progress.elapsed" = "@border.focused"
+"accent.secondary" = "$violet"
+"accent.tertiary" = "$pink"

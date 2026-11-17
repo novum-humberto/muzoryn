@@ -1,0 +1,23 @@
+[package]
+name = "muzoryn"
+version = "6.9.1-Pro"
+edition = "2021"
+rust-version = "1.82"
+description = "MUZORYN: reproductor musical en terminal (Rust, Ratatui, Rodio)"
+license = "MIT"
+
+[dependencies]
+ratatui = "=0.29.0"
+crossterm = "=0.28.1"
+rodio = { version = "=0.21.1", features = ["symphonia-all"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+lofty = "0.22"
+ureq = "2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

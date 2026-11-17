@@ -1,0 +1,31 @@
+schema_version = 1
+name = "Daylight"
+
+[palette]
+base = "#F1F5FA"
+panel = "#FFFFFF"
+text = "#1B2433"
+muted = "#4A5A73"
+border = "#B9C6DA"
+cyan = "#0A7C94"
+violet = "#5B3FD6"
+pink = "#B52A9F"
+amber = "#8A5200"
+red = "#B3261E"
+green = "#1E7A46"
+
+[semantic]
+"surface.base" = "$base"
+"surface.panel" = "$panel"
+"text.primary" = "$text"
+"text.secondary" = "$muted"
+"border.normal" = "$border"
+"border.focused" = "$cyan"
+"selection.foreground" = "$panel"
+"selection.background" = "@border.focused"
+"playback.active" = "$amber"
+"status.error" = "$red"
+"status.ok" = "$green"
+"progress.elapsed" = "@border.focused"
+"accent.secondary" = "$violet"
+"accent.tertiary" = "$pink"
