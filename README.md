@@ -959,3 +959,9 @@ MIT — consulta el archivo `LICENSE`.
 ⭐ Si te gusta, ¡dale una estrella al repositorio!
 
 </div>
+
+---
+
+## 🤖 Asistencia durante el desarrollo
+
+En esta aplicación se han utilizado **ChatGPT (OpenAI)** y **Claude (Anthropic)** como herramientas de asistencia para construir partes del código. Su participación ha sido de apoyo durante el proceso de desarrollo; MUZORYN es un proyecto mantenido por su autor.
