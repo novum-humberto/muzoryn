@@ -1,4 +1,12 @@
 //! Motor de audio: Rodio + cadena DSP (ecualizador, ReplayGain, espectro) y crossfade.
+use crate::{
+    dsp::{self, Biquad, EQ_BANDS, EQ_FREQS},
+    media::{self, MediaSource, QueueItem},
+};
+use rodio::{
+    source::SeekError, ChannelCount, Decoder, OutputStream, OutputStreamBuilder, SampleRate, Sink,
+    Source,
+};
 use std::{
     fs::File,
     sync::{
@@ -6,11 +14,6 @@ use std::{
         Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
-};
-use rodio::{source::SeekError, ChannelCount, Decoder, OutputStream, OutputStreamBuilder, Sink, SampleRate, Source};
-use crate::{
-    dsp::{self, Biquad, EQ_BANDS, EQ_FREQS},
-    media::{self, MediaSource, QueueItem},
 };
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -27,11 +30,33 @@ pub trait AudioEngine {
     fn opener(&self) -> Opener<Self::Prepared>;
     /// Empieza a reproducir una fuente abierta. Con `crossfade > 0` y reproducción activa,
     /// la pista anterior se desvanece mientras entra la nueva.
-    fn attach(&mut self, prepared: Self::Prepared, item: &QueueItem, crossfade: Duration) -> Result<Option<Duration>, String>;
+    fn attach(
+        &mut self,
+        prepared: Self::Prepared,
+        item: &QueueItem,
+        crossfade: Duration,
+    ) -> Result<Option<Duration>, String>;
     /// Abre y empieza a reproducir en el acto (bloquea hasta abrir; para archivos locales).
     fn load(&mut self, item: &QueueItem, crossfade: Duration) -> Result<Option<Duration>, String> {
         let prepared = (self.opener())(item)?;
         self.attach(prepared, item, crossfade)
+    }
+    /// `true` si el motor puede encadenar la pista siguiente sin silencio (gapless).
+    fn supports_gapless(&self) -> bool {
+        false
+    }
+    /// Pone en cola, detrás de la pista que suena, una fuente ya abierta: empieza justo
+    /// cuando termina la actual, sin hueco. Devuelve la duración de la pista encadenada.
+    fn append_next(
+        &mut self,
+        _prepared: Self::Prepared,
+        _item: &QueueItem,
+    ) -> Result<Option<Duration>, String> {
+        Err("Este motor no encadena pistas".into())
+    }
+    /// `true` mientras hay una pista encadenada esperando a que termine la actual.
+    fn has_queued_next(&self) -> bool {
+        false
     }
     fn pause(&self);
     fn resume(&self);
@@ -44,9 +69,13 @@ pub trait AudioEngine {
     fn set_eq_enabled(&self, _on: bool) {}
     fn set_replay_gain(&mut self, _on: bool) {}
     /// Últimas muestras mono y su frecuencia de muestreo, para el espectro.
-    fn spectrum_samples(&self) -> (Vec<f32>, u32) { (Vec::new(), 44100) }
+    fn spectrum_samples(&self) -> (Vec<f32>, u32) {
+        (Vec::new(), 44100)
+    }
     /// Canción en vivo que anuncia la emisora (ICY), si la hay.
-    fn stream_title(&self) -> Option<String> { None }
+    fn stream_title(&self) -> Option<String> {
+        None
+    }
     /// Mantenimiento periódico (fundidos).
     fn tick(&mut self) {}
 }
@@ -93,9 +122,17 @@ impl DspSource {
         let rate = inner.sample_rate();
         shared.rate.store(rate, Ordering::Relaxed);
         let mut source = DspSource {
-            inner, shared, channels, rate,
+            inner,
+            shared,
+            channels,
+            rate,
             filters: vec![[Biquad::IDENTITY; EQ_BANDS]; (channels as usize).max(1)],
-            seen_version: 0, eq_on: true, gain, channel: 0, counter: 0, tap: Vec::with_capacity(512),
+            seen_version: 0,
+            eq_on: true,
+            gain,
+            channel: 0,
+            counter: 0,
+            tap: Vec::with_capacity(512),
         };
         source.refresh();
         source
@@ -120,7 +157,9 @@ impl DspSource {
         if let Ok(mut shared_tap) = self.shared.tap.try_lock() {
             shared_tap.extend_from_slice(&self.tap);
             let len = shared_tap.len();
-            if len > 2048 { shared_tap.drain(0..len - 2048); }
+            if len > 2048 {
+                shared_tap.drain(0..len - 2048);
+            }
             self.tap.clear();
         } else if self.tap.len() > 4096 {
             self.tap.clear();
@@ -134,45 +173,69 @@ impl Iterator for DspSource {
     fn next(&mut self) -> Option<f32> {
         let x = self.inner.next()?;
         self.counter = self.counter.wrapping_add(1);
-        if self.counter % 1024 == 0 { self.refresh(); }
+        if self.counter % 1024 == 0 {
+            self.refresh();
+        }
         let channel = self.channel;
         self.channel += 1;
-        if self.channel >= self.filters.len() { self.channel = 0; }
+        if self.channel >= self.filters.len() {
+            self.channel = 0;
+        }
         let mut y = x;
         if self.eq_on {
-            for filter in self.filters[channel].iter_mut() { y = filter.process(y); }
+            for filter in self.filters[channel].iter_mut() {
+                y = filter.process(y);
+            }
         }
         y = (y * self.gain).clamp(-1.0, 1.0);
         if channel == 0 {
             self.tap.push(y);
-            if self.tap.len() >= 256 { self.flush_tap(); }
+            if self.tap.len() >= 256 {
+                self.flush_tap();
+            }
         }
         Some(y)
     }
 }
 
 impl Source for DspSource {
-    fn current_span_len(&self) -> Option<usize> { self.inner.current_span_len() }
-    fn channels(&self) -> ChannelCount { self.channels }
-    fn sample_rate(&self) -> SampleRate { self.rate }
-    fn total_duration(&self) -> Option<Duration> { self.inner.total_duration() }
-    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> { self.inner.try_seek(pos) }
+    fn current_span_len(&self) -> Option<usize> {
+        self.inner.current_span_len()
+    }
+    fn channels(&self) -> ChannelCount {
+        self.channels
+    }
+    fn sample_rate(&self) -> SampleRate {
+        self.rate
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+        self.inner.try_seek(pos)
+    }
 }
 
-pub type Opened = (Box<dyn Source + Send>, Option<Duration>, Option<media::StreamTitle>);
+pub type Opened = (
+    Box<dyn Source + Send>,
+    Option<Duration>,
+    Option<media::StreamTitle>,
+);
 
 fn open_source(item: &QueueItem) -> Result<Opened, String> {
     match &item.media {
         MediaSource::File(path) => {
             let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let decoder = Decoder::try_from(file).map_err(|e| format!("{}: {e}", path.display()))?;
+            let decoder =
+                Decoder::try_from(file).map_err(|e| format!("{}: {e}", path.display()))?;
             let duration = decoder.total_duration();
             Ok((Box::new(decoder), duration, None))
         }
         MediaSource::Url(url) => {
             let (reader, title) = media::open_url(url, item.live)?;
             // `Decoder::new` no asume que el origen sea buscable (rodio >= 0.21).
-            let decoder = Decoder::new(reader).map_err(|e| format!("Flujo no reproducible: {e}"))?;
+            let decoder =
+                Decoder::new(reader).map_err(|e| format!("Flujo no reproducible: {e}"))?;
             Ok((Box::new(decoder), None, item.live.then_some(title)))
         }
     }
@@ -203,23 +266,44 @@ impl RodioEngine {
         stream.log_on_drop(false);
         let sink = Sink::connect_new(stream.mixer());
         Ok(Self {
-            stream, sink, fading_out: Vec::new(), fade_in: None, shared: Shared::new(),
-            volume: std::cell::Cell::new(0.7), replay_gain: true, icy: None,
+            stream,
+            sink,
+            fading_out: Vec::new(),
+            fade_in: None,
+            shared: Shared::new(),
+            volume: std::cell::Cell::new(0.7),
+            replay_gain: true,
+            icy: None,
         })
     }
 }
 
 fn progress(started: Instant, length: Duration) -> f32 {
-    if length.is_zero() { 1.0 } else { (started.elapsed().as_secs_f32() / length.as_secs_f32()).min(1.0) }
+    if length.is_zero() {
+        1.0
+    } else {
+        (started.elapsed().as_secs_f32() / length.as_secs_f32()).min(1.0)
+    }
 }
 
 impl AudioEngine for RodioEngine {
     type Prepared = Opened;
-    fn opener(&self) -> Opener<Opened> { Box::new(open_source) }
-    fn attach(&mut self, opened: Opened, item: &QueueItem, crossfade: Duration) -> Result<Option<Duration>, String> {
+    fn opener(&self) -> Opener<Opened> {
+        Box::new(open_source)
+    }
+    fn attach(
+        &mut self,
+        opened: Opened,
+        item: &QueueItem,
+        crossfade: Duration,
+    ) -> Result<Option<Duration>, String> {
         // Se decodifica antes de tocar nada: una fuente defectuosa conserva la reproducción actual.
         let (source, duration, icy) = opened;
-        let gain = if self.replay_gain { item.rg_db.map(dsp::db_to_linear).unwrap_or(1.0) } else { 1.0 };
+        let gain = if self.replay_gain {
+            item.rg_db.map(dsp::db_to_linear).unwrap_or(1.0)
+        } else {
+            1.0
+        };
         let dsp_source = DspSource::new(source, self.shared.clone(), gain.clamp(0.05, 4.0));
         let fade = !crossfade.is_zero() && !self.sink.empty() && !self.sink.is_paused();
         let new_sink = Sink::connect_new(self.stream.mixer());
@@ -228,7 +312,11 @@ impl AudioEngine for RodioEngine {
         self.icy = icy;
         let old = std::mem::replace(&mut self.sink, new_sink);
         if fade {
-            self.fading_out.push(Fading { sink: old, started: Instant::now(), length: crossfade });
+            self.fading_out.push(Fading {
+                sink: old,
+                started: Instant::now(),
+                length: crossfade,
+            });
             self.fade_in = Some((Instant::now(), crossfade));
         } else {
             old.stop();
@@ -236,29 +324,81 @@ impl AudioEngine for RodioEngine {
         }
         Ok(duration)
     }
-    fn pause(&self) { self.sink.pause(); }
-    fn resume(&self) { self.sink.play(); }
-    fn stop(&self) { self.sink.stop(); }
+    fn supports_gapless(&self) -> bool {
+        true
+    }
+    fn append_next(
+        &mut self,
+        opened: Opened,
+        item: &QueueItem,
+    ) -> Result<Option<Duration>, String> {
+        if self.sink.empty() {
+            return Err("No hay pista en curso a la que encadenar".into());
+        }
+        // Misma cadena DSP que `attach`, pero en el mismo `Sink`: la cola de Rodio empieza la
+        // fuente siguiente en la muestra exacta en que acaba la anterior.
+        let (source, duration, _icy) = opened;
+        let gain = if self.replay_gain {
+            item.rg_db.map(dsp::db_to_linear).unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        let dsp_source = DspSource::new(source, self.shared.clone(), gain.clamp(0.05, 4.0));
+        self.sink.append(dsp_source);
+        Ok(duration)
+    }
+    fn has_queued_next(&self) -> bool {
+        self.sink.len() > 1
+    }
+    fn pause(&self) {
+        self.sink.pause();
+    }
+    fn resume(&self) {
+        self.sink.play();
+    }
+    fn stop(&self) {
+        self.sink.stop();
+    }
     fn volume(&self, value: f32) {
         self.volume.set(value);
-        if self.fade_in.is_none() { self.sink.set_volume(value); }
+        if self.fade_in.is_none() {
+            self.sink.set_volume(value);
+        }
     }
     fn seek(&self, position: Duration) -> Result<(), String> {
-        self.sink.try_seek(position).map_err(|_| "Esta fuente no admite buscar".to_string())
+        self.sink
+            .try_seek(position)
+            .map_err(|_| "Esta fuente no admite buscar".to_string())
     }
-    fn position(&self) -> Duration { self.sink.get_pos() }
-    fn ended(&self) -> bool { self.sink.empty() }
+    fn position(&self) -> Duration {
+        self.sink.get_pos()
+    }
+    fn ended(&self) -> bool {
+        self.sink.empty()
+    }
     fn set_eq(&self, gains: [f32; EQ_BANDS]) {
         *lock(&self.shared.eq_gains) = gains;
         self.shared.eq_version.fetch_add(1, Ordering::Relaxed);
     }
-    fn set_eq_enabled(&self, on: bool) { self.shared.eq_enabled.store(on, Ordering::Relaxed); }
-    fn set_replay_gain(&mut self, on: bool) { self.replay_gain = on; }
+    fn set_eq_enabled(&self, on: bool) {
+        self.shared.eq_enabled.store(on, Ordering::Relaxed);
+    }
+    fn set_replay_gain(&mut self, on: bool) {
+        self.replay_gain = on;
+    }
     fn spectrum_samples(&self) -> (Vec<f32>, u32) {
-        (lock(&self.shared.tap).clone(), self.shared.rate.load(Ordering::Relaxed))
+        (
+            lock(&self.shared.tap).clone(),
+            self.shared.rate.load(Ordering::Relaxed),
+        )
     }
     fn stream_title(&self) -> Option<String> {
-        let title = self.icy.as_ref()?.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let title = self
+            .icy
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         Some(title).filter(|t| !t.is_empty())
     }
     fn tick(&mut self) {
@@ -266,7 +406,9 @@ impl AudioEngine for RodioEngine {
         if let Some((started, length)) = self.fade_in {
             let t = progress(started, length);
             self.sink.set_volume(volume * t);
-            if t >= 1.0 { self.fade_in = None; }
+            if t >= 1.0 {
+                self.fade_in = None;
+            }
         }
         let current = std::mem::take(&mut self.fading_out);
         for fade in current {
@@ -287,7 +429,9 @@ pub struct NullEngine {
 }
 
 impl NullEngine {
-    pub fn new(reason: String) -> Self { Self { reason } }
+    pub fn new(reason: String) -> Self {
+        Self { reason }
+    }
 }
 
 impl AudioEngine for NullEngine {
@@ -303,7 +447,13 @@ impl AudioEngine for NullEngine {
     fn resume(&self) {}
     fn stop(&self) {}
     fn volume(&self, _: f32) {}
-    fn seek(&self, _: Duration) -> Result<(), String> { Err("Audio no disponible".into()) }
-    fn position(&self) -> Duration { Duration::ZERO }
-    fn ended(&self) -> bool { true }
+    fn seek(&self, _: Duration) -> Result<(), String> {
+        Err("Audio no disponible".into())
+    }
+    fn position(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn ended(&self) -> bool {
+        true
+    }
 }

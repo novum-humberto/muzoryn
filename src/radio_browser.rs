@@ -29,15 +29,31 @@ struct ApiStation {
 }
 
 const PREFIXES: [(&str, &str); 9] = [
-    ("country:", "country"), ("país:", "country"), ("pais:", "country"),
-    ("language:", "language"), ("idioma:", "language"),
-    ("genre:", "tag"), ("género:", "tag"), ("genero:", "tag"), ("tag:", "tag"),
+    ("country:", "country"),
+    ("país:", "country"),
+    ("pais:", "country"),
+    ("language:", "language"),
+    ("idioma:", "language"),
+    ("genre:", "tag"),
+    ("género:", "tag"),
+    ("genero:", "tag"),
+    ("tag:", "tag"),
 ];
 
 fn plain(text: &str) -> String {
-    text.trim().to_lowercase().chars().map(|c| match c {
-        'á' => 'a', 'é' => 'e', 'í' => 'i', 'ó' => 'o', 'ú' | 'ü' => 'u', 'ñ' => 'n', other => other,
-    }).collect()
+    text.trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'á' => 'a',
+            'é' => 'e',
+            'í' => 'i',
+            'ó' => 'o',
+            'ú' | 'ü' => 'u',
+            'ñ' => 'n',
+            other => other,
+        })
+        .collect()
 }
 
 /// Código ISO del país a partir de su nombre en español o inglés, o el propio código de dos letras.
@@ -90,7 +106,9 @@ fn country_code(value: &str) -> Option<String> {
         "belgica" | "belgium" => "BE",
         "polonia" | "poland" => "PL",
         _ => {
-            if v.len() == 2 && v.chars().all(|c| c.is_ascii_alphabetic()) { return Some(v.to_uppercase()); }
+            if v.len() == 2 && v.chars().all(|c| c.is_ascii_alphabetic()) {
+                return Some(v.to_uppercase());
+            }
             return None;
         }
     };
@@ -154,10 +172,15 @@ fn genre_name(value: &str) -> String {
 }
 
 pub(crate) fn encode(value: &str) -> String {
-    value.bytes().map(|b| match b {
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-        _ => format!("%{b:02X}"),
-    }).collect()
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// Separa la consulta en filtros combinables: texto libre (nombre) más `country:`, `language:` y `genre:`.
@@ -166,7 +189,10 @@ fn filters(query: &str) -> Result<Vec<(&'static str, String)>, String> {
     let mut prev_space = true;
     for (i, ch) in query.char_indices() {
         if prev_space {
-            if let Some((prefix, field)) = PREFIXES.iter().find(|(prefix, _)| query[i..].starts_with(*prefix)) {
+            if let Some((prefix, field)) = PREFIXES
+                .iter()
+                .find(|(prefix, _)| query[i..].starts_with(*prefix))
+            {
                 marks.push((i, prefix.len(), *field));
             }
         }
@@ -174,11 +200,17 @@ fn filters(query: &str) -> Result<Vec<(&'static str, String)>, String> {
     }
     let mut out: Vec<(&'static str, String)> = Vec::new();
     let head = marks.first().map(|m| &query[..m.0]).unwrap_or(query).trim();
-    if !head.is_empty() { out.push(("name", head.to_string())); }
+    if !head.is_empty() {
+        out.push(("name", head.to_string()));
+    }
     for (n, (start, len, field)) in marks.iter().enumerate() {
         let end = marks.get(n + 1).map(|m| m.0).unwrap_or(query.len());
         let value = query[start + len..end].trim();
-        if value.is_empty() { return Err("Escribe un valor después del filtro (country:, language: o genre:)".into()); }
+        if value.is_empty() {
+            return Err(
+                "Escribe un valor después del filtro (country:, language: o genre:)".into(),
+            );
+        }
         out.push((*field, value.to_string()));
     }
     Ok(out)
@@ -188,34 +220,62 @@ fn filters(query: &str) -> Result<Vec<(&'static str, String)>, String> {
 /// (por ejemplo `genre:jazz country:japón`).
 pub fn search(query: &str) -> Result<Vec<StationResult>, String> {
     let query = query.trim();
-    if query.is_empty() { return Err("Escribe un término para buscar emisoras".into()); }
+    if query.is_empty() {
+        return Err("Escribe un término para buscar emisoras".into());
+    }
     let mut params: Vec<String> = Vec::new();
     for (field, value) in filters(query)? {
         let (key, val) = if field == "country" {
-            match country_code(&value) { Some(code) => ("countrycode", code), None => ("country", value) }
+            match country_code(&value) {
+                Some(code) => ("countrycode", code),
+                None => ("country", value),
+            }
         } else if field == "language" {
             (field, language_name(&value))
         } else if field == "tag" {
             (field, genre_name(&value))
-        } else { (field, value) };
+        } else {
+            (field, value)
+        };
         params.push(format!("{key}={}", encode(&val)));
     }
     let url = format!("https://de1.api.radio-browser.info/json/stations/search?{}&limit=40&order=clickcount&reverse=true&hidebroken=true", params.join("&"));
-    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(12)).build();
-    let response = agent.get(&url)
-        .set("User-Agent", concat!("MUZORYN/", env!("CARGO_PKG_VERSION"), " RadioBrowser"))
-        .call().map_err(|e| format!("Radio Browser no disponible: {e}"))?;
-    let body = response.into_string().map_err(|e| format!("No se pudo leer la respuesta de Radio Browser: {e}"))?;
-    let rows: Vec<ApiStation> = serde_json::from_str(&body).map_err(|e| format!("Respuesta de Radio Browser no válida: {e}"))?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(12))
+        .redirects(0)
+        .build();
+    let response = crate::media::get_checked(
+        &agent,
+        &url,
+        &[(
+            "User-Agent",
+            concat!("MUZORYN/", env!("CARGO_PKG_VERSION"), " RadioBrowser"),
+        )],
+    )
+    .map_err(|e| format!("Radio Browser no disponible: {e}"))?;
+    let body = response
+        .into_string()
+        .map_err(|e| format!("No se pudo leer la respuesta de Radio Browser: {e}"))?;
+    let rows: Vec<ApiStation> = serde_json::from_str(&body)
+        .map_err(|e| format!("Respuesta de Radio Browser no válida: {e}"))?;
     let mut out = Vec::new();
     for row in rows {
-        if row.lastcheckok == Some(0) { continue; }
+        if row.lastcheckok == Some(0) {
+            continue;
+        }
         let name = row.name.unwrap_or_default().trim().to_string();
-        let url = row.url_resolved.filter(|s| !s.trim().is_empty()).or(row.url).unwrap_or_default();
-        if name.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) { continue; }
+        let url = row
+            .url_resolved
+            .filter(|s| !s.trim().is_empty())
+            .or(row.url)
+            .unwrap_or_default();
+        if name.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
+            continue;
+        }
         out.push(StationResult {
             uuid: row.stationuuid.unwrap_or_default(),
-            name, url,
+            name,
+            url,
             country: row.country.unwrap_or_default(),
             language: row.language.unwrap_or_default(),
             tags: row.tags.unwrap_or_default(),
@@ -229,12 +289,22 @@ pub fn search(query: &str) -> Result<Vec<StationResult>, String> {
 /// Avisa a Radio Browser de que se reproduce una emisora (cuenta un «clic» de popularidad).
 /// Solo envía el `stationuuid`; los fallos se ignoran porque no afectan a la reproducción.
 pub fn register_click(uuid: &str) {
-    if uuid.is_empty() || !uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') { return; }
+    if uuid.is_empty() || !uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return;
+    }
     let url = format!("https://de1.api.radio-browser.info/json/url/{uuid}");
-    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(8)).build();
-    let _ = agent.get(&url)
-        .set("User-Agent", concat!("MUZORYN/", env!("CARGO_PKG_VERSION"), " RadioBrowser"))
-        .call();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(8))
+        .redirects(0)
+        .build();
+    let _ = crate::media::get_checked(
+        &agent,
+        &url,
+        &[(
+            "User-Agent",
+            concat!("MUZORYN/", env!("CARGO_PKG_VERSION"), " RadioBrowser"),
+        )],
+    );
 }
 
 #[cfg(test)]
@@ -244,7 +314,13 @@ mod tests {
     #[test]
     fn combines_genre_and_country() {
         let f = filters("genre:jazz country:japón").unwrap();
-        assert_eq!(f, vec![("tag", "jazz".to_string()), ("country", "japón".to_string())]);
+        assert_eq!(
+            f,
+            vec![
+                ("tag", "jazz".to_string()),
+                ("country", "japón".to_string())
+            ]
+        );
         assert_eq!(country_code("japón").as_deref(), Some("JP"));
         assert_eq!(country_code("Estados Unidos").as_deref(), Some("US"));
         assert_eq!(country_code("xx").as_deref(), Some("XX"));
@@ -259,7 +335,14 @@ mod tests {
         assert_eq!(genre_name("Clásica"), "classical");
         assert_eq!(genre_name("salsa"), "salsa");
         let f = filters("género:salsa país:cuba idioma:Español").unwrap();
-        assert_eq!(f, vec![("tag", "salsa".to_string()), ("country", "cuba".to_string()), ("language", "Español".to_string())]);
+        assert_eq!(
+            f,
+            vec![
+                ("tag", "salsa".to_string()),
+                ("country", "cuba".to_string()),
+                ("language", "Español".to_string())
+            ]
+        );
         assert_eq!(country_code("Cuba").as_deref(), Some("CU"));
     }
 
@@ -272,7 +355,10 @@ mod tests {
 
     #[test]
     fn plain_name_mixed_and_errors() {
-        assert_eq!(filters("jazz fm").unwrap(), vec![("name", "jazz fm".to_string())]);
+        assert_eq!(
+            filters("jazz fm").unwrap(),
+            vec![("name", "jazz fm".to_string())]
+        );
         assert_eq!(filters("salsa genre:tropical").unwrap().len(), 2);
         assert!(filters("genre:").is_err());
     }

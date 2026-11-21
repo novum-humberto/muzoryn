@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentación
+    url: https://github.com/TU-USUARIO/muzoryn/tree/main/docs
+    about: Guías de instalación, uso, MPRIS, gapless y solución de problemas

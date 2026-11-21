@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  completo:
+    name: Formato, pruebas y Clippy (con MPRIS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencias del sistema
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formato
+        run: cargo fmt --all -- --check
+      - name: Pruebas
+        run: cargo test --all-targets
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  sin-mpris:
+    name: Compilación y pruebas sin MPRIS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencias del sistema
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Pruebas sin MPRIS
+        run: cargo test --all-targets --no-default-features

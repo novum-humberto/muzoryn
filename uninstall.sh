@@ -29,7 +29,22 @@ for P in "${CANDIDATES[@]}"; do
   run() { if [ -w "$P" ] || [ "$(id -u)" -eq 0 ]; then "$@"; elif command -v sudo >/dev/null; then sudo "$@"; else die "se necesita root para borrar en $P"; fi; }
   say "Eliminando de $P"
   run rm -f "$P/bin/muzoryn"
-  run rm -rf "$P/share/muzoryn" "$P/share/doc/muzoryn"
+
+  # En una instalación --user, PREFIX suele ser ~/.local y
+  # PREFIX/share/muzoryn coincide exactamente con XDG_DATA_HOME/muzoryn.
+  # Esa carpeta contiene biblioteca, podcasts, listas y otros datos del usuario:
+  # nunca se borra durante una desinstalación normal.
+  APP_DATA="$P/share/muzoryn"
+  USER_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/muzoryn"
+  APP_DATA_REAL="$(realpath -m "$APP_DATA")"
+  USER_DATA_REAL="$(realpath -m "$USER_DATA")"
+  if [ "$APP_DATA_REAL" != "$USER_DATA_REAL" ]; then
+    run rm -rf "$APP_DATA"
+  else
+    say "Conservando datos del usuario en $USER_DATA"
+  fi
+
+  run rm -rf "$P/share/doc/muzoryn"
   run rm -f "$P/share/icons/hicolor/scalable/apps/muzoryn.svg" "$P/share/icons/hicolor/512x512/apps/muzoryn.png" "$P/share/applications/muzoryn.desktop"
 done
 [ "$FOUND" -eq 1 ] || echo "No se encontró ninguna instalación de MUZORYN en: ${CANDIDATES[*]}"

@@ -2,34 +2,60 @@
 use std::f32::consts::PI;
 
 pub const EQ_BANDS: usize = 10;
-pub const EQ_FREQS: [f32; EQ_BANDS] =
-    [31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
-pub const EQ_LABELS: [&str; EQ_BANDS] =
-    ["32", "64", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"];
+pub const EQ_FREQS: [f32; EQ_BANDS] = [
+    31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+];
+pub const EQ_LABELS: [&str; EQ_BANDS] = [
+    "32", "64", "125", "250", "500", "1k", "2k", "4k", "8k", "16k",
+];
 pub const EQ_RANGE_DB: f32 = 12.0;
 pub const SPECTRUM_BANDS: usize = 48;
 
 pub const EQ_PRESETS: [(&str, [f32; EQ_BANDS]); 7] = [
     ("Plano", [0.0; EQ_BANDS]),
-    ("Rock", [4.0, 3.0, 2.0, -1.0, -2.0, -1.0, 2.0, 3.0, 4.0, 4.0]),
+    (
+        "Rock",
+        [4.0, 3.0, 2.0, -1.0, -2.0, -1.0, 2.0, 3.0, 4.0, 4.0],
+    ),
     ("Pop", [-1.0, 1.0, 3.0, 4.0, 3.0, 0.0, -1.0, -1.0, 1.0, 2.0]),
     ("Jazz", [3.0, 2.0, 1.0, 2.0, -2.0, -2.0, 0.0, 1.0, 2.0, 3.0]),
-    ("Clásica", [4.0, 3.0, 2.0, 1.0, -1.0, -1.0, 0.0, 2.0, 3.0, 4.0]),
+    (
+        "Clásica",
+        [4.0, 3.0, 2.0, 1.0, -1.0, -1.0, 0.0, 2.0, 3.0, 4.0],
+    ),
     ("Bajos", [6.0, 5.0, 4.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-    ("Voces", [-2.0, -1.0, 0.0, 2.0, 4.0, 4.0, 3.0, 1.0, 0.0, -1.0]),
+    (
+        "Voces",
+        [-2.0, -1.0, 0.0, 2.0, 4.0, 4.0, 3.0, 1.0, 0.0, -1.0],
+    ),
 ];
 
-pub fn db_to_linear(db: f32) -> f32 { 10f32.powf(db / 20.0) }
+pub fn db_to_linear(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
 
 /// Filtro biquad en forma transpuesta II.
 #[derive(Clone, Copy, Debug)]
 pub struct Biquad {
-    b0: f32, b1: f32, b2: f32, a1: f32, a2: f32, z1: f32, z2: f32,
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1: f32,
+    z2: f32,
 }
 
 impl Biquad {
-    pub const IDENTITY: Biquad =
-        Biquad { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0, z1: 0.0, z2: 0.0 };
+    pub const IDENTITY: Biquad = Biquad {
+        b0: 1.0,
+        b1: 0.0,
+        b2: 0.0,
+        a1: 0.0,
+        a2: 0.0,
+        z1: 0.0,
+        z2: 0.0,
+    };
 
     /// Filtro «peaking» de la receta RBJ. Conserva el estado interno si ya existía.
     pub fn peaking(rate: f32, freq: f32, gain_db: f32, q: f32) -> Biquad {
@@ -69,11 +95,17 @@ impl Biquad {
 
 /// Energía por banda (0..1) en escala logarítmica mediante Goertzel con ventana Hann.
 pub fn spectrum(samples: &[f32], rate: u32, bands: usize) -> Vec<f32> {
-    if bands == 0 { return Vec::new(); }
-    if samples.len() < 256 || rate == 0 { return vec![0.0; bands]; }
+    if bands == 0 {
+        return Vec::new();
+    }
+    if samples.len() < 256 || rate == 0 {
+        return vec![0.0; bands];
+    }
     let n = samples.len().min(1024);
     let slice = &samples[samples.len() - n..];
-    let windowed: Vec<f32> = slice.iter().enumerate()
+    let windowed: Vec<f32> = slice
+        .iter()
+        .enumerate()
         .map(|(i, s)| s * (0.5 - 0.5 * (2.0 * PI * i as f32 / (n as f32 - 1.0)).cos()))
         .collect();
     let nyquist = rate as f32 / 2.0;
@@ -118,7 +150,10 @@ mod tests {
         for i in 0..48000 {
             let x = (2.0 * PI * 1000.0 * i as f32 / rate).sin() * 0.1;
             let y = f.process(x);
-            if i > 24000 { peak_in = peak_in.max(x.abs()); peak_out = peak_out.max(y.abs()); }
+            if i > 24000 {
+                peak_in = peak_in.max(x.abs());
+                peak_out = peak_out.max(y.abs());
+            }
         }
         assert!(peak_out > peak_in * 3.0, "{peak_out} vs {peak_in}");
     }
@@ -126,10 +161,14 @@ mod tests {
     fn spectrum_finds_tone() {
         let rate = 44100u32;
         let samples: Vec<f32> = (0..2048)
-            .map(|i| (2.0 * PI * 1000.0 * i as f32 / rate as f32).sin() * 0.5).collect();
+            .map(|i| (2.0 * PI * 1000.0 * i as f32 / rate as f32).sin() * 0.5)
+            .collect();
         let bands = spectrum(&samples, rate, 32);
-        let (peak, _) = bands.iter().enumerate()
-            .fold((0, 0.0f32), |a, (i, v)| if *v > a.1 { (i, *v) } else { a });
+        let (peak, _) =
+            bands
+                .iter()
+                .enumerate()
+                .fold((0, 0.0f32), |a, (i, v)| if *v > a.1 { (i, *v) } else { a });
         assert!((10..24).contains(&peak), "pico en {peak}");
         let silent = spectrum(&vec![0.0; 2048], rate, 32);
         assert!(silent.iter().all(|v| *v < 0.3));

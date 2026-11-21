@@ -1,6 +1,6 @@
 [package]
 name = "muzoryn"
-version = "6.9.1-Pro"
+version = "7.0.1"
 edition = "2021"
 rust-version = "1.82"
 description = "MUZORYN: reproductor musical en terminal (Rust, Ratatui, Rodio)"
@@ -17,6 +17,13 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 lofty = "0.22"
 ureq = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+libc = "=0.2.191"
+zbus = { version = "=4.4.0", optional = true }
+
+[features]
+default = ["mpris"]
+# Control multimedia MPRIS 2 por D-Bus (daemon).
+mpris = ["dep:zbus"]
 
 [profile.release]
 lto = "thin"

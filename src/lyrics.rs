@@ -13,15 +13,25 @@ impl Lyrics {
     pub fn load_for(audio: &Path) -> Option<Lyrics> {
         let text = fs::read_to_string(audio.with_extension("lrc")).ok()?;
         let lyrics = parse(&text);
-        if lyrics.lines.is_empty() { None } else { Some(lyrics) }
+        if lyrics.lines.is_empty() {
+            None
+        } else {
+            Some(lyrics)
+        }
     }
 
     /// Índice de la línea activa para una posición en milisegundos.
     pub fn current(&self, position_ms: i64) -> Option<usize> {
-        if !self.synced || self.lines.is_empty() { return None; }
+        if !self.synced || self.lines.is_empty() {
+            return None;
+        }
         let mut found = None;
         for (i, (time, _)) in self.lines.iter().enumerate() {
-            if *time <= position_ms { found = Some(i); } else { break; }
+            if *time <= position_ms {
+                found = Some(i);
+            } else {
+                break;
+            }
         }
         found
     }
@@ -38,9 +48,17 @@ fn parse_stamp(stamp: &str) -> Option<i64> {
     let millis: i64 = if fraction.is_empty() {
         0
     } else {
-        let digits: String = fraction.chars().filter(|c| c.is_ascii_digit()).take(3).collect();
+        let digits: String = fraction
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .take(3)
+            .collect();
         let value: i64 = digits.parse().ok()?;
-        match digits.len() { 1 => value * 100, 2 => value * 10, _ => value }
+        match digits.len() {
+            1 => value * 100,
+            2 => value * 10,
+            _ => value,
+        }
     };
     Some((minutes * 60 + seconds) * 1000 + millis)
 }
@@ -56,22 +74,37 @@ pub fn parse(text: &str) -> Lyrics {
             let Some(end) = rest.find(']') else { break };
             match parse_stamp(&rest[..end]) {
                 Some(ms) => stamps.push(ms),
-                None => { metadata = true; break; }
+                None => {
+                    metadata = true;
+                    break;
+                }
             }
             line = rest[end + 1..].trim_start();
         }
-        if metadata { continue; }
+        if metadata {
+            continue;
+        }
         if stamps.is_empty() {
-            if !line.is_empty() { plain.push(line.to_string()); }
+            if !line.is_empty() {
+                plain.push(line.to_string());
+            }
         } else {
-            for ms in stamps { timed.push((ms, line.trim().to_string())); }
+            for ms in stamps {
+                timed.push((ms, line.trim().to_string()));
+            }
         }
     }
     if !timed.is_empty() {
         timed.sort_by_key(|(ms, _)| *ms);
-        Lyrics { lines: timed, synced: true }
+        Lyrics {
+            lines: timed,
+            synced: true,
+        }
     } else {
-        Lyrics { lines: plain.into_iter().map(|t| (0, t)).collect(), synced: false }
+        Lyrics {
+            lines: plain.into_iter().map(|t| (0, t)).collect(),
+            synced: false,
+        }
     }
 }
 

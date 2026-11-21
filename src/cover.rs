@@ -1,8 +1,14 @@
 //! Carátulas reales: etiqueta embebida, imagen de la carpeta o imagen del feed.
 //! Se decodifican en un hilo aparte y se guardan como miniaturas pequeñas.
-use std::{io::Read, path::{Path, PathBuf}};
+use crate::{
+    feeds,
+    media::{get_checked, http_agent},
+};
 use lofty::{file::TaggedFileExt, picture::PictureType};
-use crate::{feeds, media::http_agent};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 /// Lado máximo de la versión de medios bloques (fallback universal).
 pub const HALF: u32 = 96;
@@ -49,17 +55,36 @@ pub fn load(src: &CoverSource) -> Option<Thumb> {
 fn decode(bytes: &[u8]) -> Option<Thumb> {
     use image::{imageops::FilterType, DynamicImage, ImageEncoder};
     let img = image::load_from_memory(bytes).ok()?;
-    if img.width() == 0 || img.height() == 0 { return None; }
-    let hi = if img.width() > HI || img.height() > HI { img.thumbnail(HI, HI).to_rgb8() } else { img.to_rgb8() };
+    if img.width() == 0 || img.height() == 0 {
+        return None;
+    }
+    let hi = if img.width() > HI || img.height() > HI {
+        img.thumbnail(HI, HI).to_rgb8()
+    } else {
+        img.to_rgb8()
+    };
     let (hi_w, hi_h) = hi.dimensions();
     let mut png = Vec::new();
     image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(hi.as_raw(), hi_w, hi_h, image::ExtendedColorType::Rgb8).ok()?;
-    let small = DynamicImage::ImageRgb8(hi).resize(HALF, HALF, FilterType::Lanczos3).to_rgb8();
+        .write_image(hi.as_raw(), hi_w, hi_h, image::ExtendedColorType::Rgb8)
+        .ok()?;
+    let small = DynamicImage::ImageRgb8(hi)
+        .resize(HALF, HALF, FilterType::Lanczos3)
+        .to_rgb8();
     let (w, h) = small.dimensions();
-    if w == 0 || h == 0 { return None; }
+    if w == 0 || h == 0 {
+        return None;
+    }
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Some(Thumb { id, hi_w, hi_h, png, w, h, px: small.pixels().map(|p| p.0).collect() })
+    Some(Thumb {
+        id,
+        hi_w,
+        hi_h,
+        png,
+        w,
+        h,
+        px: small.pixels().map(|p| p.0).collect(),
+    })
 }
 
 fn file_cover(path: &Path) -> Option<Thumb> {
@@ -68,35 +93,55 @@ fn file_cover(path: &Path) -> Option<Thumb> {
         for tag in tagged.tags() {
             for pic in tag.pictures() {
                 if pic.pic_type() == PictureType::CoverFront {
-                    if let Some(t) = decode(pic.data()) { return Some(t); }
+                    if let Some(t) = decode(pic.data()) {
+                        return Some(t);
+                    }
                 } else if fallback.is_none() {
                     fallback = Some(pic.data().to_vec());
                 }
             }
         }
-        if let Some(t) = fallback.as_deref().and_then(decode) { return Some(t); }
+        if let Some(t) = fallback.as_deref().and_then(decode) {
+            return Some(t);
+        }
     }
     folder_cover(path.parent()?)
 }
 
 fn folder_cover(dir: &Path) -> Option<Thumb> {
     const NAMES: [&str; 6] = ["cover", "folder", "front", "album", "albumart", "artwork"];
-    let mut found: Vec<(usize, PathBuf)> = std::fs::read_dir(dir).ok()?.flatten().filter_map(|e| {
-        let p = e.path();
-        let ext = p.extension()?.to_string_lossy().to_lowercase();
-        if !matches!(ext.as_str(), "jpg" | "jpeg" | "png") { return None; }
-        let stem = p.file_stem()?.to_string_lossy().to_lowercase();
-        NAMES.iter().position(|n| *n == stem).map(|i| (i, p))
-    }).collect();
+    let mut found: Vec<(usize, PathBuf)> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            let ext = p.extension()?.to_string_lossy().to_lowercase();
+            if !matches!(ext.as_str(), "jpg" | "jpeg" | "png") {
+                return None;
+            }
+            let stem = p.file_stem()?.to_string_lossy().to_lowercase();
+            NAMES.iter().position(|n| *n == stem).map(|i| (i, p))
+        })
+        .collect();
     found.sort();
-    found.into_iter().find_map(|(_, p)| decode(&std::fs::read(p).ok()?))
+    found
+        .into_iter()
+        .find_map(|(_, p)| decode(&std::fs::read(p).ok()?))
 }
 
 fn feed_cover_bytes(feed_url: &str) -> Option<Vec<u8>> {
     let agent = http_agent();
-    let body = agent.get(feed_url).call().ok()?.into_string().ok()?;
+    let body = get_checked(&agent, feed_url, &[])
+        .ok()?
+        .into_string()
+        .ok()?;
     let image_url = feeds::channel_image(&body)?;
     let mut bytes = Vec::new();
-    agent.get(&image_url).call().ok()?.into_reader().take(8_000_000).read_to_end(&mut bytes).ok()?;
+    get_checked(&agent, &image_url, &[])
+        .ok()?
+        .into_reader()
+        .take(8_000_000)
+        .read_to_end(&mut bytes)
+        .ok()?;
     Some(bytes)
 }

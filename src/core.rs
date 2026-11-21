@@ -1,35 +1,69 @@
 //! Núcleo de reproducción: cola, estado, comandos, modos de repetición/aleatorio,
 //! crossfade, espectro y servicio en hilo propio.
-use std::{
-    process::Stdio,
-    sync::{mpsc, Arc, Mutex, MutexGuard},
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
-use serde::{Deserialize, Serialize};
 use crate::{
     audio::{AudioEngine, NullEngine, RodioEngine},
     config::{Hook, Settings},
     dsp::{self, EQ_BANDS, SPECTRUM_BANDS},
     media::{MediaSource, QueueItem},
 };
+use serde::{Deserialize, Serialize};
+use std::{
+    sync::{mpsc, Arc, Mutex, MutexGuard},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+/// Diagnóstico del gapless: con `MUZORYN_DEBUG_GAPLESS=1` escribe en `/tmp/muzoryn-gapless.log`.
+fn gdbg(msg: &str) {
+    if std::env::var_os("MUZORYN_DEBUG_GAPLESS").is_none() {
+        return;
+    }
+    use std::io::Write;
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() % 1_000_000)
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("muzoryn-gapless.log"))
+    {
+        let _ = writeln!(f, "[{ms:>6}] {msg}");
+    }
+}
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Repeat { Off, All, One }
+pub enum Repeat {
+    Off,
+    All,
+    One,
+}
 
 impl Repeat {
     pub fn cycle(self) -> Repeat {
-        match self { Repeat::Off => Repeat::All, Repeat::All => Repeat::One, Repeat::One => Repeat::Off }
+        match self {
+            Repeat::Off => Repeat::All,
+            Repeat::All => Repeat::One,
+            Repeat::One => Repeat::Off,
+        }
     }
     pub fn as_str(self) -> &'static str {
-        match self { Repeat::Off => "off", Repeat::All => "all", Repeat::One => "one" }
+        match self {
+            Repeat::Off => "off",
+            Repeat::All => "all",
+            Repeat::One => "one",
+        }
     }
-    pub fn from_str(text: &str) -> Repeat {
-        match text { "all" => Repeat::All, "one" => Repeat::One, _ => Repeat::Off }
+    pub fn parse(text: &str) -> Repeat {
+        match text {
+            "all" => Repeat::All,
+            "one" => Repeat::One,
+            _ => Repeat::Off,
+        }
     }
 }
 
@@ -39,7 +73,10 @@ pub enum Command {
     PlayIndex(usize),
     Enqueue(QueueItem),
     EnqueueMany(Vec<QueueItem>),
-    Replace { items: Vec<QueueItem>, start: usize },
+    Replace {
+        items: Vec<QueueItem>,
+        start: usize,
+    },
     Remove(usize),
     MoveUp(usize),
     MoveDown(usize),
@@ -50,6 +87,10 @@ pub enum Command {
     Previous,
     VolumeDelta(f32),
     SeekBy(i64),
+    /// Desplazamiento relativo en microsegundos (interfaz MPRIS).
+    SeekByMicros(i64),
+    /// Posición absoluta de reproducción, con precisión de microsegundos.
+    SeekTo(Duration),
     ToggleShuffle,
     CycleRepeat,
     SetEq([f32; EQ_BANDS]),
@@ -60,7 +101,11 @@ pub enum Command {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Playback { Stopped, Playing, Paused }
+pub enum Playback {
+    Stopped,
+    Playing,
+    Paused,
+}
 
 /// Estado de la conexión de una emisora en directo.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +121,16 @@ pub enum StreamState {
 
 /// Esperas antes de cada intento de reconexión (el primero es inmediato).
 const RETRY_DELAYS_SECS: [u64; 6] = [0, 2, 5, 10, 20, 30];
+
+/// Cuánto antes del final se abre y se encadena la pista siguiente (reproducción sin hueco).
+const GAPLESS_LEAD: Duration = Duration::from_millis(1500);
+
+/// Pista ya encadenada en el motor que empezará sola cuando termine la actual.
+struct GaplessNext {
+    index: usize,
+    item: QueueItem,
+    duration: Option<Duration>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -99,16 +154,33 @@ pub struct Snapshot {
     pub now_playing: Option<String>,
     #[serde(default)]
     pub stream: StreamState,
+    /// Solo en el protocolo IPC: la cola no cambió desde el snapshot anterior y se omite
+    /// (`queue` viaja vacía); el cliente conserva la que ya tenía.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub queue_same: bool,
 }
 
 impl Snapshot {
     pub fn new(queue: Vec<QueueItem>) -> Self {
         Self {
-            queue, current: None, playback: Playback::Stopped,
-            position: Duration::ZERO, duration: None, volume: 0.7, error: None,
-            shuffle: false, repeat: Repeat::Off, eq: [0.0; EQ_BANDS], eq_enabled: true,
-            replay_gain: true, crossfade_secs: 0, spectrum: vec![0.0; SPECTRUM_BANDS],
-            sample_rate: 0, now_playing: None, stream: StreamState::Idle,
+            queue,
+            current: None,
+            playback: Playback::Stopped,
+            position: Duration::ZERO,
+            duration: None,
+            volume: 0.7,
+            error: None,
+            shuffle: false,
+            repeat: Repeat::Off,
+            eq: [0.0; EQ_BANDS],
+            eq_enabled: true,
+            replay_gain: true,
+            crossfade_secs: 0,
+            spectrum: vec![0.0; SPECTRUM_BANDS],
+            sample_rate: 0,
+            now_playing: None,
+            stream: StreamState::Idle,
+            queue_same: false,
         }
     }
 
@@ -136,6 +208,10 @@ pub struct Core<E: AudioEngine> {
     engine: E,
     hooks: Vec<Hook>,
     fade_started: bool,
+    /// Pista encadenada (gapless) a la espera de que termine la actual.
+    gapless: Option<GaplessNext>,
+    /// Ya se intentó encadenar durante esta pista (evita reintentar en cada `tick`).
+    gapless_tried: bool,
     rng: u64,
     /// Reconexión en curso: (intentos hechos, cuándo toca el siguiente).
     retry: Option<(usize, Instant)>,
@@ -146,10 +222,23 @@ pub struct Core<E: AudioEngine> {
 impl<E: AudioEngine> Core<E> {
     pub fn new(engine: E, queue: Vec<QueueItem>) -> Self {
         engine.volume(0.7);
-        let seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(88172645463325252);
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(88172645463325252);
         Self {
-            state: Snapshot::new(queue), engine, hooks: Vec::new(), fade_started: false, rng: seed | 1,
-            retry: None, retry_delays: RETRY_DELAYS_SECS.iter().map(|s| Duration::from_secs(*s)).collect(),
+            state: Snapshot::new(queue),
+            engine,
+            hooks: Vec::new(),
+            fade_started: false,
+            gapless: None,
+            gapless_tried: false,
+            rng: seed | 1,
+            retry: None,
+            retry_delays: RETRY_DELAYS_SECS
+                .iter()
+                .map(|s| Duration::from_secs(*s))
+                .collect(),
             pending: None,
         }
     }
@@ -165,7 +254,7 @@ impl<E: AudioEngine> Core<E> {
         self.engine.set_replay_gain(settings.replay_gain);
         self.state.crossfade_secs = settings.crossfade_secs.min(12);
         self.state.shuffle = settings.shuffle;
-        self.state.repeat = Repeat::from_str(&settings.repeat);
+        self.state.repeat = Repeat::parse(&settings.repeat);
         self.hooks = settings.hooks.clone();
     }
 
@@ -180,38 +269,49 @@ impl<E: AudioEngine> Core<E> {
 
     fn random_other(&mut self, current: Option<usize>) -> usize {
         let len = self.state.queue.len();
-        if len <= 1 { return 0; }
+        if len <= 1 {
+            return 0;
+        }
         loop {
             let pick = (self.random() % len as u64) as usize;
-            if Some(pick) != current { return pick; }
-        }
-    }
-
-    fn fire_hooks(&self, event: &str) {
-        let item = self.state.current_item();
-        for hook in self.hooks.iter().filter(|h| h.event == event) {
-            let mut command = std::process::Command::new("sh");
-            command.arg("-c").arg(&hook.command)
-                .env("MUZORYN_EVENT", event)
-                .env("MUZORYN_TITLE", item.map(|i| i.title.as_str()).unwrap_or(""))
-                .env("MUZORYN_ARTIST", item.map(|i| i.artist.as_str()).unwrap_or(""))
-                .env("MUZORYN_ALBUM", item.map(|i| i.album.as_str()).unwrap_or(""))
-                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-            if let Ok(mut child) = command.spawn() {
-                thread::spawn(move || { let _ = child.wait(); });
+            if Some(pick) != current {
+                return pick;
             }
         }
     }
 
+    fn fire_hooks(&self, event: &str) {
+        #[cfg(unix)]
+        {
+            let item = self.state.current_item();
+            crate::hooks::fire(
+                &self.hooks,
+                event,
+                item.map(|i| i.title.as_str()).unwrap_or(""),
+                item.map(|i| i.artist.as_str()).unwrap_or(""),
+                item.map(|i| i.album.as_str()).unwrap_or(""),
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = event;
+    }
+
     fn start(&mut self, index: usize) -> Result<(), String> {
-        let item = self.state.queue.get(index).ok_or("Índice de cola no válido")?.clone();
+        let item = self
+            .state
+            .queue
+            .get(index)
+            .ok_or("Índice de cola no válido")?
+            .clone();
         if matches!(item.media, MediaSource::Url(_)) {
             self.begin_open(index, item, false);
             return Ok(());
         }
         let crossfade = if self.state.playback == Playback::Playing {
             Duration::from_secs(self.state.crossfade_secs as u64)
-        } else { Duration::ZERO };
+        } else {
+            Duration::ZERO
+        };
         let duration = self.engine.load(&item, crossfade)?;
         self.pending = None;
         self.finish_start(index, &item, duration);
@@ -221,13 +321,19 @@ impl<E: AudioEngine> Core<E> {
     /// Estado tras empezar a sonar una pista.
     fn finish_start(&mut self, index: usize, item: &QueueItem, duration: Option<Duration>) {
         self.retry = None;
-        self.state.stream = if item.live { StreamState::Live } else { StreamState::Idle };
+        self.state.stream = if item.live {
+            StreamState::Live
+        } else {
+            StreamState::Idle
+        };
         self.state.now_playing = None;
         self.state.current = Some(index);
         self.state.duration = duration.or(item.duration);
         self.state.position = Duration::ZERO;
         self.state.playback = Playback::Playing;
         self.fade_started = false;
+        self.gapless = None;
+        self.gapless_tried = false;
         self.fire_hooks("track_changed");
     }
 
@@ -236,7 +342,9 @@ impl<E: AudioEngine> Core<E> {
     fn begin_open(&mut self, index: usize, item: QueueItem, reconnect: bool) {
         let crossfade = if !reconnect && self.state.playback == Playback::Playing {
             Duration::from_secs(self.state.crossfade_secs as u64)
-        } else { Duration::ZERO };
+        } else {
+            Duration::ZERO
+        };
         let (prev_current, prev_duration, prev_stream) = match self.pending.take() {
             Some(old) => (old.prev_current, old.prev_duration, old.prev_stream),
             None => (self.state.current, self.state.duration, self.state.stream),
@@ -244,29 +352,49 @@ impl<E: AudioEngine> Core<E> {
         let open = self.engine.opener();
         let (tx, rx) = mpsc::channel();
         let target = item.clone();
-        thread::spawn(move || { let _ = tx.send(open(&target)); });
+        thread::spawn(move || {
+            let _ = tx.send(open(&target));
+        });
         if reconnect {
             self.state.stream = StreamState::Reconnecting;
         } else {
-            self.state.stream = StreamState::Connecting;
+            // Si ya suena una pista normal (archivo o episodio) no se muestra «Conectando…» ni
+            // se borra la duración: evita el parpadeo al pasar de un episodio a otro.
+            let audible = prev_stream == StreamState::Idle
+                && prev_current.is_some()
+                && self.state.playback == Playback::Playing;
+            if !audible {
+                self.state.stream = StreamState::Connecting;
+                self.state.duration = None;
+            }
             self.state.current = Some(index);
-            self.state.duration = None;
         }
         self.pending = Some(Pending {
-            index, rx, crossfade, reconnect, pushed: false, prev_current, prev_duration, prev_stream,
+            index,
+            rx,
+            crossfade,
+            reconnect,
+            pushed: false,
+            prev_current,
+            prev_duration,
+            prev_stream,
         });
     }
 
     /// Recoge el resultado de una apertura en segundo plano, si ya terminó.
     fn poll_pending(&mut self) {
-        let Some(pending) = self.pending.as_ref() else { return };
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
         let result = match pending.rx.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => Err("la conexión se interrumpió".to_string()),
         };
         let Some(p) = self.pending.take() else { return };
-        let Some(item) = self.state.queue.get(p.index).cloned() else { return };
+        let Some(item) = self.state.queue.get(p.index).cloned() else {
+            return;
+        };
         let outcome = result.and_then(|prepared| self.engine.attach(prepared, &item, p.crossfade));
         match (outcome, p.reconnect) {
             (Ok(_), true) => {
@@ -282,8 +410,14 @@ impl<E: AudioEngine> Core<E> {
                 self.state.current = p.prev_current;
                 self.state.duration = p.prev_duration;
                 self.state.stream = p.prev_stream;
-                if p.pushed && self.state.queue.len() == p.index + 1 { self.state.queue.pop(); }
-                self.state.error = Some(if item.live { format!("Emisora no disponible: {error}") } else { error });
+                if p.pushed && self.state.queue.len() == p.index + 1 {
+                    self.state.queue.pop();
+                }
+                self.state.error = Some(if item.live {
+                    format!("Emisora no disponible: {error}")
+                } else {
+                    error
+                });
             }
         }
     }
@@ -291,13 +425,18 @@ impl<E: AudioEngine> Core<E> {
     /// Descarta una apertura en curso (la pista a la que apuntaba ya no es válida).
     fn cancel_pending(&mut self) {
         if self.pending.take().is_some()
-            && matches!(self.state.stream, StreamState::Connecting | StreamState::Reconnecting) {
+            && matches!(
+                self.state.stream,
+                StreamState::Connecting | StreamState::Reconnecting
+            )
+        {
             self.state.stream = StreamState::Idle;
         }
     }
 
     fn stop_playback(&mut self) {
         self.pending = None;
+        self.gapless = None;
         self.engine.stop();
         self.state.playback = Playback::Stopped;
         self.state.position = Duration::ZERO;
@@ -314,14 +453,22 @@ impl<E: AudioEngine> Core<E> {
     /// La emisora en directo se cortó: reintenta con esperas crecientes y, si no hay
     /// manera, se detiene avisando de que no está disponible.
     fn reconnect(&mut self) {
-        if self.pending.is_some() { return; }
-        let Some(index) = self.state.current else { return };
-        let Some(item) = self.state.queue.get(index).cloned() else { return };
+        if self.pending.is_some() {
+            return;
+        }
+        let Some(index) = self.state.current else {
+            return;
+        };
+        let Some(item) = self.state.queue.get(index).cloned() else {
+            return;
+        };
         let now = Instant::now();
         let first_wait = self.retry_delays.first().copied().unwrap_or_default();
         let (_, next_at) = *self.retry.get_or_insert((0, now + first_wait));
         self.state.stream = StreamState::Reconnecting;
-        if now >= next_at { self.begin_open(index, item, true); }
+        if now >= next_at {
+            self.begin_open(index, item, true);
+        }
     }
 
     fn reconnect_failed(&mut self, error: String) {
@@ -333,7 +480,9 @@ impl<E: AudioEngine> Core<E> {
             self.state.stream = StreamState::Unavailable;
             self.state.now_playing = None;
             self.retry = None;
-            self.state.error = Some(format!("Emisora no disponible tras {attempt} intentos: {error}"));
+            self.state.error = Some(format!(
+                "Emisora no disponible tras {attempt} intentos: {error}"
+            ));
             self.fire_hooks("playback_stopped");
         } else {
             self.state.stream = StreamState::Reconnecting;
@@ -342,7 +491,14 @@ impl<E: AudioEngine> Core<E> {
     }
 
     pub fn handle(&mut self, command: Command) -> Result<(), String> {
-        if matches!(command, Command::Remove(_) | Command::MoveUp(_) | Command::MoveDown(_) | Command::Clear | Command::Replace { .. }) {
+        if matches!(
+            command,
+            Command::Remove(_)
+                | Command::MoveUp(_)
+                | Command::MoveDown(_)
+                | Command::Clear
+                | Command::Replace { .. }
+        ) {
             self.cancel_pending();
         }
         match command {
@@ -356,7 +512,9 @@ impl<E: AudioEngine> Core<E> {
                         self.state.queue.pop();
                         return Err(error);
                     }
-                    if let Some(pending) = self.pending.as_mut() { pending.pushed = true; }
+                    if let Some(pending) = self.pending.as_mut() {
+                        pending.pushed = true;
+                    }
                 }
             }
             Command::PlayIndex(i) => self.start(i)?,
@@ -389,7 +547,13 @@ impl<E: AudioEngine> Core<E> {
                 if i > 0 && i < self.state.queue.len() {
                     self.state.queue.swap(i, i - 1);
                     self.state.current = self.state.current.map(|c| {
-                        if c == i { i - 1 } else if c == i - 1 { i } else { c }
+                        if c == i {
+                            i - 1
+                        } else if c == i - 1 {
+                            i
+                        } else {
+                            c
+                        }
                     });
                 }
             }
@@ -397,7 +561,13 @@ impl<E: AudioEngine> Core<E> {
                 if i + 1 < self.state.queue.len() {
                     self.state.queue.swap(i, i + 1);
                     self.state.current = self.state.current.map(|c| {
-                        if c == i { i + 1 } else if c == i + 1 { i } else { c }
+                        if c == i {
+                            i + 1
+                        } else if c == i + 1 {
+                            i
+                        } else {
+                            c
+                        }
                     });
                 }
             }
@@ -407,8 +577,14 @@ impl<E: AudioEngine> Core<E> {
                 self.stop_playback();
             }
             Command::Toggle => match self.state.playback {
-                Playback::Playing => { self.engine.pause(); self.state.playback = Playback::Paused; }
-                Playback::Paused => { self.engine.resume(); self.state.playback = Playback::Playing; }
+                Playback::Playing => {
+                    self.engine.pause();
+                    self.state.playback = Playback::Paused;
+                }
+                Playback::Paused => {
+                    self.engine.resume();
+                    self.state.playback = Playback::Playing;
+                }
                 Playback::Stopped if !self.state.queue.is_empty() => {
                     self.start(self.state.current.unwrap_or(0))?
                 }
@@ -417,7 +593,9 @@ impl<E: AudioEngine> Core<E> {
             Command::Stop => self.stop_playback(),
             Command::Next => self.advance(false)?,
             Command::Previous => {
-                if self.state.queue.is_empty() { return Ok(()); }
+                if self.state.queue.is_empty() {
+                    return Ok(());
+                }
                 let current = self.state.current.unwrap_or(0);
                 if self.state.position > Duration::from_secs(3) {
                     self.start(current)?;
@@ -430,7 +608,9 @@ impl<E: AudioEngine> Core<E> {
                 }
             }
             Command::VolumeDelta(delta) => {
-                if !delta.is_finite() { return Err("Volumen no finito".into()); }
+                if !delta.is_finite() {
+                    return Err("Volumen no finito".into());
+                }
                 self.state.volume = (self.state.volume + delta).clamp(0.0, 1.0);
                 self.engine.volume(self.state.volume);
             }
@@ -438,11 +618,29 @@ impl<E: AudioEngine> Core<E> {
                 if self.state.playback != Playback::Stopped {
                     let position = self.engine.position();
                     let shift = Duration::from_secs(delta.unsigned_abs());
-                    let mut target = if delta < 0 { position.saturating_sub(shift) }
-                        else { position.saturating_add(shift) };
-                    if let Some(duration) = self.state.duration { target = target.min(duration); }
-                    self.engine.seek(target)?;
-                    self.state.position = self.engine.position();
+                    let target = if delta < 0 {
+                        position.saturating_sub(shift)
+                    } else {
+                        position.saturating_add(shift)
+                    };
+                    self.seek_to(target)?;
+                }
+            }
+            Command::SeekByMicros(delta) => {
+                if self.state.playback != Playback::Stopped {
+                    let position = self.engine.position();
+                    let shift = Duration::from_micros(delta.unsigned_abs());
+                    let target = if delta < 0 {
+                        position.saturating_sub(shift)
+                    } else {
+                        position.saturating_add(shift)
+                    };
+                    self.seek_to(target)?;
+                }
+            }
+            Command::SeekTo(target) => {
+                if self.state.playback != Playback::Stopped {
+                    self.seek_to(target)?;
                 }
             }
             Command::ToggleShuffle => self.state.shuffle = !self.state.shuffle,
@@ -450,7 +648,11 @@ impl<E: AudioEngine> Core<E> {
             Command::SetEq(gains) => {
                 let mut clean = gains;
                 for g in clean.iter_mut() {
-                    *g = if g.is_finite() { g.clamp(-dsp::EQ_RANGE_DB, dsp::EQ_RANGE_DB) } else { 0.0 };
+                    *g = if g.is_finite() {
+                        g.clamp(-dsp::EQ_RANGE_DB, dsp::EQ_RANGE_DB)
+                    } else {
+                        0.0
+                    };
                 }
                 self.state.eq = clean;
                 self.engine.set_eq(clean);
@@ -469,13 +671,29 @@ impl<E: AudioEngine> Core<E> {
         Ok(())
     }
 
+    fn seek_to(&mut self, target: Duration) -> Result<(), String> {
+        let target = self
+            .state
+            .duration
+            .map_or(target, |duration| target.min(duration));
+        self.engine.seek(target)?;
+        self.state.position = self.engine.position();
+        Ok(())
+    }
+
     /// Siguiente índice según repetición y aleatorio. `auto` = fin natural de pista.
     fn next_index(&mut self, auto: bool) -> Option<usize> {
         let len = self.state.queue.len();
-        if len == 0 { return None; }
+        if len == 0 {
+            return None;
+        }
         let current = self.state.current;
-        if auto && self.state.repeat == Repeat::One { return current; }
-        if self.state.shuffle && len > 1 { return Some(self.random_other(current)); }
+        if auto && self.state.repeat == Repeat::One {
+            return current;
+        }
+        if self.state.shuffle && len > 1 {
+            return Some(self.random_other(current));
+        }
         match current {
             None => Some(0),
             Some(i) if i + 1 < len => Some(i + 1),
@@ -508,7 +726,95 @@ impl<E: AudioEngine> Core<E> {
             self.state.spectrum = vec![0.0; SPECTRUM_BANDS];
         }
         for (old, new) in self.state.spectrum.iter_mut().zip(target.iter()) {
-            *old = if *new > *old { *new } else { *old * 0.82 + *new * 0.18 };
+            *old = if *new > *old {
+                *new
+            } else {
+                *old * 0.82 + *new * 0.18
+            };
+        }
+    }
+
+    /// Intenta abrir y encadenar la pista siguiente cuando falta poco para el final.
+    /// Solo para archivos locales y con el crossfade desactivado (si no, manda el crossfade).
+    fn try_gapless(&mut self) {
+        if !self.engine.supports_gapless()
+            || self.gapless.is_some()
+            || self.gapless_tried
+            || self.fade_started
+            || self.state.crossfade_secs != 0
+            || !self
+                .state
+                .current_item()
+                .is_some_and(|item| matches!(&item.media, MediaSource::File(_)))
+        {
+            return;
+        }
+        let Some(duration) = self.state.duration else {
+            return;
+        };
+        if duration.saturating_sub(self.state.position) > GAPLESS_LEAD {
+            return;
+        }
+        self.gapless_tried = true;
+        gdbg(&format!(
+            "intento: pos={:?} dur={:?}",
+            self.state.position, duration
+        ));
+        let Some(index) = self.next_index(true) else {
+            gdbg("sin pista siguiente");
+            return;
+        };
+        let Some(item) = self.state.queue.get(index).cloned() else {
+            return;
+        };
+        if !matches!(item.media, MediaSource::File(_)) {
+            gdbg("la siguiente no es archivo local");
+            return;
+        }
+        // Si no se puede abrir o encadenar no pasa nada: al terminar la pista actual el
+        // camino normal (`advance`) lo intentará y mostrará el error.
+        let opener = self.engine.opener();
+        let Ok(prepared) = opener(&item) else {
+            gdbg("no se pudo abrir la siguiente");
+            return;
+        };
+        match self.engine.append_next(prepared, &item) {
+            Ok(next_duration) => {
+                gdbg(&format!("encadenada #{index} ({})", item.title));
+                self.gapless = Some(GaplessNext {
+                    index,
+                    duration: next_duration.or(item.duration),
+                    item,
+                });
+            }
+            Err(e) => gdbg(&format!("append_next falló: {e}")),
+        }
+    }
+
+    /// La pista anterior terminó y la encadenada ya está sonando: pasa el estado a ella.
+    fn complete_gapless(&mut self) {
+        let Some(next) = self.gapless.take() else {
+            return;
+        };
+        gdbg(&format!("cambio gapless completado -> #{}", next.index));
+        // La cola pudo reordenarse mientras tanto: se localiza la pista por su origen.
+        let index = if self
+            .state
+            .queue
+            .get(next.index)
+            .is_some_and(|q| q.media == next.item.media)
+        {
+            Some(next.index)
+        } else {
+            self.state
+                .queue
+                .iter()
+                .position(|q| q.media == next.item.media)
+        };
+        match index {
+            Some(i) => self.finish_start(i, &next.item, next.duration),
+            // Se quitó de la cola justo antes de empezar: se corta en lugar de seguir.
+            None => self.stop_playback(),
         }
     }
 
@@ -516,9 +822,22 @@ impl<E: AudioEngine> Core<E> {
         self.engine.tick();
         self.update_spectrum();
         self.poll_pending();
-        if self.state.playback != Playback::Playing || self.pending.is_some() { return; }
+        if self.state.playback != Playback::Playing || self.pending.is_some() {
+            return;
+        }
+        if self.gapless.is_some() && !self.engine.has_queued_next() {
+            self.complete_gapless();
+            return;
+        }
         if self.engine.ended() {
-            if self.current_is_live() { self.reconnect(); return; }
+            gdbg(&format!(
+                "pista terminada SIN encadenar (gapless_tried={})",
+                self.gapless_tried
+            ));
+            if self.current_is_live() {
+                self.reconnect();
+                return;
+            }
             if let Err(error) = self.advance(true) {
                 self.state.error = Some(error);
                 self.state.playback = Playback::Stopped;
@@ -526,18 +845,25 @@ impl<E: AudioEngine> Core<E> {
             return;
         }
         self.state.position = self.engine.position();
-        self.state.now_playing = if self.current_is_live() { self.engine.stream_title() } else { None };
+        self.state.now_playing = if self.current_is_live() {
+            self.engine.stream_title()
+        } else {
+            None
+        };
         let fade = Duration::from_secs(self.state.crossfade_secs as u64);
         if !fade.is_zero() && !self.fade_started {
             if let Some(duration) = self.state.duration {
                 if duration > fade * 2 && duration.saturating_sub(self.state.position) <= fade {
                     self.fade_started = true;
                     if let Some(next) = self.next_index(true) {
-                        if let Err(error) = self.start(next) { self.state.error = Some(error); }
+                        if let Err(error) = self.start(next) {
+                            self.state.error = Some(error);
+                        }
                     }
                 }
             }
         }
+        self.try_gapless();
     }
 }
 
@@ -547,17 +873,25 @@ pub trait AudioHandle: Send {
     fn send(&self, command: Command) -> Result<(), String>;
     fn snapshot(&self) -> Snapshot;
     /// `true` si el audio vive en un daemon externo.
-    fn is_remote(&self) -> bool { false }
+    fn is_remote(&self) -> bool {
+        false
+    }
 }
 
-fn run_loop<E: AudioEngine>(mut core: Core<E>, rx: mpsc::Receiver<Command>, output: Arc<Mutex<Snapshot>>) {
+fn run_loop<E: AudioEngine>(
+    mut core: Core<E>,
+    rx: mpsc::Receiver<Command>,
+    output: Arc<Mutex<Snapshot>>,
+) {
     loop {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = core.handle(Command::Shutdown);
                 break;
             }
-            Ok(command) => { core.state.error = core.handle(command).err(); }
+            Ok(command) => {
+                core.state.error = core.handle(command).err();
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         core.tick();
@@ -589,36 +923,71 @@ impl LocalService {
                 run_loop(core, rx, output);
             }
         });
-        Self { tx: Mutex::new(Some(tx)), latest, worker: Mutex::new(Some(worker)) }
+        Self {
+            tx: Mutex::new(Some(tx)),
+            latest,
+            worker: Mutex::new(Some(worker)),
+        }
+    }
+}
+
+impl LocalService {
+    /// Cierre ordenado: pide parar al hilo de audio y espera a que termine.
+    pub fn shutdown_and_wait(&self) {
+        if let Some(tx) = lock(&self.tx).take() {
+            let _ = tx.send(Command::Shutdown);
+        }
+        if let Some(worker) = lock(&self.worker).take() {
+            let _ = worker.join();
+        }
     }
 }
 
 impl AudioHandle for LocalService {
     fn send(&self, command: Command) -> Result<(), String> {
         match lock(&self.tx).as_ref() {
-            Some(tx) => tx.try_send(command).map_err(|e| format!("Comando no enviado: {e}")),
+            Some(tx) => tx
+                .try_send(command)
+                .map_err(|e| format!("Comando no enviado: {e}")),
             None => Err("Servicio cerrado".into()),
         }
     }
-    fn snapshot(&self) -> Snapshot { lock(&self.latest).clone() }
+    fn snapshot(&self) -> Snapshot {
+        lock(&self.latest).clone()
+    }
 }
 
 impl Drop for LocalService {
     fn drop(&mut self) {
         // Cerrar el canal basta; no se bloquea la UI al salir.
         lock(&self.tx).take();
-        if let Some(worker) = lock(&self.worker).take() { let _ = worker.join(); }
+        if let Some(worker) = lock(&self.worker).take() {
+            let _ = worker.join();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::Cell, path::Path, sync::atomic::{AtomicU32, Ordering}};
+    use std::{
+        cell::Cell,
+        path::Path,
+        sync::atomic::{AtomicU32, Ordering},
+    };
 
     #[derive(Default)]
     struct Fake {
-        ended: Cell<bool>, position: Cell<Duration>, paused: Cell<bool>, loads: Cell<u32>,
+        ended: Cell<bool>,
+        position: Cell<Duration>,
+        paused: Cell<bool>,
+        loads: Cell<u32>,
+        /// El motor falso admite encadenar pistas (gapless).
+        gapless: Cell<bool>,
+        /// Hay una pista encadenada esperando.
+        queued: Cell<bool>,
+        /// Cuántas pistas se han encadenado.
+        appended: Cell<u32>,
         /// Aperturas que deben fallar antes de volver a funcionar.
         fail: Arc<AtomicU32>,
         title: std::cell::RefCell<Option<String>>,
@@ -629,31 +998,72 @@ mod tests {
         fn opener(&self) -> crate::audio::Opener<()> {
             let fail = self.fail.clone();
             Box::new(move |item| {
-                if item.file_path() == Some(Path::new("bad")) { return Err("bad file".into()); }
-                if fail.load(Ordering::SeqCst) > 0 { fail.fetch_sub(1, Ordering::SeqCst); return Err("sin red".into()); }
+                if item.file_path() == Some(Path::new("bad")) {
+                    return Err("bad file".into());
+                }
+                if fail.load(Ordering::SeqCst) > 0 {
+                    fail.fetch_sub(1, Ordering::SeqCst);
+                    return Err("sin red".into());
+                }
                 Ok(())
             })
         }
-        fn attach(&mut self, _: (), _: &QueueItem, _: Duration) -> Result<Option<Duration>, String> {
+        fn attach(
+            &mut self,
+            _: (),
+            _: &QueueItem,
+            _: Duration,
+        ) -> Result<Option<Duration>, String> {
             self.ended.set(false);
             self.position.set(Duration::ZERO);
             self.loads.set(self.loads.get() + 1);
             Ok(Some(Duration::from_secs(100)))
         }
-        fn pause(&self) { self.paused.set(true); }
-        fn resume(&self) { self.paused.set(false); }
-        fn stop(&self) { self.ended.set(true); }
+        fn supports_gapless(&self) -> bool {
+            self.gapless.get()
+        }
+        fn append_next(&mut self, _: (), _: &QueueItem) -> Result<Option<Duration>, String> {
+            self.queued.set(true);
+            self.appended.set(self.appended.get() + 1);
+            Ok(Some(Duration::from_secs(100)))
+        }
+        fn has_queued_next(&self) -> bool {
+            self.queued.get()
+        }
+        fn pause(&self) {
+            self.paused.set(true);
+        }
+        fn resume(&self) {
+            self.paused.set(false);
+        }
+        fn stop(&self) {
+            self.ended.set(true);
+        }
         fn volume(&self, _: f32) {}
-        fn seek(&self, p: Duration) -> Result<(), String> { self.position.set(p); Ok(()) }
-        fn position(&self) -> Duration { self.position.get() }
-        fn ended(&self) -> bool { self.ended.get() }
-        fn stream_title(&self) -> Option<String> { self.title.borrow().clone() }
+        fn seek(&self, p: Duration) -> Result<(), String> {
+            self.position.set(p);
+            Ok(())
+        }
+        fn position(&self) -> Duration {
+            self.position.get()
+        }
+        fn ended(&self) -> bool {
+            self.ended.get()
+        }
+        fn stream_title(&self) -> Option<String> {
+            self.title.borrow().clone()
+        }
     }
 
-    fn radio() -> QueueItem { QueueItem::stream("Radio", "Jazz", "https://x.test/s", true) }
+    fn radio() -> QueueItem {
+        QueueItem::stream("Radio", "Jazz", "https://x.test/s", true)
+    }
 
     fn items(names: &[&str]) -> Vec<QueueItem> {
-        names.iter().map(|n| QueueItem::from_path(Path::new(n))).collect()
+        names
+            .iter()
+            .map(|n| QueueItem::from_path(Path::new(n)))
+            .collect()
     }
 
     #[test]
@@ -669,15 +1079,28 @@ mod tests {
     }
 
     #[test]
+    fn seek_to_preserves_subsecond_precision() {
+        let mut core = Core::new(Fake::default(), items(&["one"]));
+        core.handle(Command::PlayIndex(0)).unwrap();
+        core.handle(Command::SeekTo(Duration::from_micros(1_234_567)))
+            .unwrap();
+        assert_eq!(core.state.position, Duration::from_micros(1_234_567));
+    }
+
+    #[test]
     fn end_advances_and_bad_file_preserves_current() {
         let mut core = Core::new(Fake::default(), items(&["one", "two"]));
         core.handle(Command::PlayIndex(0)).unwrap();
-        assert!(core.handle(Command::Play(QueueItem::from_path(Path::new("bad")))).is_err());
+        assert!(core
+            .handle(Command::Play(QueueItem::from_path(Path::new("bad"))))
+            .is_err());
         assert_eq!(core.state.queue.len(), 2);
         assert_eq!(core.state.current, Some(0));
-        core.engine.ended.set(true); core.tick();
+        core.engine.ended.set(true);
+        core.tick();
         assert_eq!(core.state.current, Some(1));
-        core.engine.ended.set(true); core.tick();
+        core.engine.ended.set(true);
+        core.tick();
         assert_eq!(core.state.playback, Playback::Stopped);
     }
 
@@ -686,10 +1109,12 @@ mod tests {
         let mut core = Core::new(Fake::default(), items(&["a", "b"]));
         core.handle(Command::PlayIndex(1)).unwrap();
         core.state.repeat = Repeat::All;
-        core.engine.ended.set(true); core.tick();
+        core.engine.ended.set(true);
+        core.tick();
         assert_eq!(core.state.current, Some(0));
         core.state.repeat = Repeat::One;
-        core.engine.ended.set(true); core.tick();
+        core.engine.ended.set(true);
+        core.tick();
         assert_eq!(core.state.current, Some(0));
         assert_eq!(core.state.playback, Playback::Playing);
     }
@@ -732,6 +1157,91 @@ mod tests {
         assert_eq!(core.engine.loads.get(), 2);
     }
 
+    fn gapless_core(names: &[&str]) -> Core<Fake> {
+        let core = Core::new(Fake::default(), items(names));
+        core.engine.gapless.set(true);
+        core
+    }
+
+    #[test]
+    fn gapless_chains_next_near_end_and_switches_when_it_starts() {
+        let mut core = gapless_core(&["a", "b"]);
+        core.handle(Command::PlayIndex(0)).unwrap();
+        core.engine.position.set(Duration::from_secs(99));
+        core.tick();
+        assert_eq!(core.engine.appended.get(), 1);
+        // Mientras suena el final de «a», el estado sigue en «a».
+        assert_eq!(core.state.current, Some(0));
+        // «a» termina y «b» empieza sola, sin una nueva carga.
+        core.engine.queued.set(false);
+        core.tick();
+        assert_eq!(core.state.current, Some(1));
+        assert_eq!(core.state.position, Duration::ZERO);
+        assert_eq!(core.engine.loads.get(), 1);
+    }
+
+    #[test]
+    fn gapless_does_not_chain_twice_or_far_from_the_end() {
+        let mut core = gapless_core(&["a", "b"]);
+        core.handle(Command::PlayIndex(0)).unwrap();
+        core.engine.position.set(Duration::from_secs(50));
+        core.tick();
+        assert_eq!(core.engine.appended.get(), 0);
+        core.engine.position.set(Duration::from_secs(99));
+        core.tick();
+        core.tick();
+        core.tick();
+        assert_eq!(core.engine.appended.get(), 1);
+    }
+
+    #[test]
+    fn gapless_is_off_with_crossfade_or_unsupported_engine() {
+        let mut core = gapless_core(&["a", "b"]);
+        core.handle(Command::SetCrossfade(5)).unwrap();
+        core.handle(Command::PlayIndex(0)).unwrap();
+        core.engine.position.set(Duration::from_secs(99));
+        core.tick();
+        assert_eq!(core.engine.appended.get(), 0);
+
+        let mut plain = Core::new(Fake::default(), items(&["a", "b"]));
+        plain.handle(Command::PlayIndex(0)).unwrap();
+        plain.engine.position.set(Duration::from_secs(99));
+        plain.tick();
+        assert_eq!(plain.engine.appended.get(), 0);
+    }
+
+    #[test]
+    fn gapless_does_not_chain_after_the_last_track() {
+        let mut core = gapless_core(&["a", "b"]);
+        core.handle(Command::PlayIndex(1)).unwrap();
+        core.engine.position.set(Duration::from_secs(99));
+        core.tick();
+        assert_eq!(core.engine.appended.get(), 0);
+    }
+
+    #[test]
+    fn stop_discards_a_chained_track() {
+        let mut core = gapless_core(&["a", "b"]);
+        core.handle(Command::PlayIndex(0)).unwrap();
+        core.engine.position.set(Duration::from_secs(99));
+        core.tick();
+        core.handle(Command::Stop).unwrap();
+        assert!(core.gapless.is_none());
+        assert_eq!(core.state.playback, Playback::Stopped);
+    }
+
+    #[test]
+    fn chained_track_removed_from_queue_stops_playback() {
+        let mut core = gapless_core(&["a", "b"]);
+        core.handle(Command::PlayIndex(0)).unwrap();
+        core.engine.position.set(Duration::from_secs(99));
+        core.tick();
+        core.handle(Command::Remove(1)).unwrap();
+        core.engine.queued.set(false);
+        core.tick();
+        assert_eq!(core.state.playback, Playback::Stopped);
+    }
+
     #[test]
     fn previous_restarts_when_far_into_track() {
         let mut core = Core::new(Fake::default(), items(&["a", "b"]));
@@ -754,7 +1264,9 @@ mod tests {
     fn settle(core: &mut Core<Fake>) {
         for _ in 0..400 {
             core.tick();
-            if core.pending.is_none() { return; }
+            if core.pending.is_none() {
+                return;
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("la apertura no terminó");
@@ -773,6 +1285,21 @@ mod tests {
     }
 
     #[test]
+    fn switching_to_a_streamed_episode_while_playing_does_not_flash_connecting() {
+        let mut items = items(&["a"]);
+        items.push(QueueItem::stream("Ep", "Pod", "https://x.test/e", false));
+        let mut core = Core::new(Fake::default(), items);
+        core.handle(Command::PlayIndex(0)).unwrap();
+        let duration = core.state.duration;
+        core.handle(Command::PlayIndex(1)).unwrap();
+        assert_eq!(core.state.stream, StreamState::Idle);
+        assert_eq!(core.state.duration, duration);
+        settle(&mut core);
+        assert_eq!(core.state.current, Some(1));
+        assert_eq!(core.state.playback, Playback::Playing);
+    }
+
+    #[test]
     fn stop_cancels_a_pending_connection() {
         let mut core = Core::new(Fake::default(), vec![radio()]);
         core.handle(Command::PlayIndex(0)).unwrap();
@@ -787,7 +1314,10 @@ mod tests {
 
     #[test]
     fn live_drop_reconnects_without_skipping_to_next() {
-        let mut core = Core::new(Fake::default(), vec![radio(), QueueItem::from_path(Path::new("b"))]);
+        let mut core = Core::new(
+            Fake::default(),
+            vec![radio(), QueueItem::from_path(Path::new("b"))],
+        );
         core.retry_delays = vec![Duration::ZERO; 4];
         core.handle(Command::PlayIndex(0)).unwrap();
         settle(&mut core);
@@ -797,7 +1327,9 @@ mod tests {
         for _ in 0..20 {
             core.tick();
             assert_eq!(core.state.current, Some(0));
-            if core.state.stream == StreamState::Live { break; }
+            if core.state.stream == StreamState::Live {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(core.state.stream, StreamState::Live);
@@ -815,12 +1347,19 @@ mod tests {
         core.engine.ended.set(true);
         for _ in 0..400 {
             core.tick();
-            if core.state.stream == StreamState::Unavailable { break; }
+            if core.state.stream == StreamState::Unavailable {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(core.state.stream, StreamState::Unavailable);
         assert_eq!(core.state.playback, Playback::Stopped);
-        assert!(core.state.error.as_deref().unwrap_or("").contains("no disponible"));
+        assert!(core
+            .state
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("no disponible"));
     }
 
     #[test]
@@ -831,22 +1370,37 @@ mod tests {
         core.handle(Command::Play(radio())).unwrap();
         assert_eq!(core.state.queue.len(), 2);
         settle(&mut core);
-        assert!(core.state.error.as_deref().unwrap_or("").starts_with("Emisora no disponible"));
+        assert!(core
+            .state
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("Emisora no disponible"));
         assert_eq!(core.state.stream, StreamState::Idle);
         assert_eq!(core.state.current, Some(0));
-        assert_eq!(core.state.queue.len(), 1, "la emisora fallida no queda en la cola");
+        assert_eq!(
+            core.state.queue.len(),
+            1,
+            "la emisora fallida no queda en la cola"
+        );
         assert_eq!(core.state.playback, Playback::Playing);
     }
 
     #[test]
     fn now_playing_comes_from_stream_and_clears_on_files() {
-        let mut core = Core::new(Fake::default(), vec![radio(), QueueItem::from_path(Path::new("b"))]);
+        let mut core = Core::new(
+            Fake::default(),
+            vec![radio(), QueueItem::from_path(Path::new("b"))],
+        );
         core.handle(Command::PlayIndex(0)).unwrap();
         settle(&mut core);
         assert_eq!(core.state.now_playing, None);
         *core.engine.title.borrow_mut() = Some("Miles Davis - So What".into());
         core.tick();
-        assert_eq!(core.state.now_playing.as_deref(), Some("Miles Davis - So What"));
+        assert_eq!(
+            core.state.now_playing.as_deref(),
+            Some("Miles Davis - So What")
+        );
         core.handle(Command::PlayIndex(1)).unwrap();
         core.tick();
         assert_eq!(core.state.now_playing, None);
