@@ -35,7 +35,7 @@ MUZORYN es un reproductor de música que **vive dentro de la terminal** (la vent
 <div align="center">
 <img src="docs/interfaz.png" alt="Diseño de referencia de la interfaz con las 12 vistas" width="100%">
 <br>
-<sub>🎨 <b>Imagen de diseño de referencia</b> de las 12 vistas. Fue creada con el nombre antiguo del proyecto («Sonora»); la aplicación actual se llama <b>MUZORYN</b> y respeta esta distribución.</sub>
+<sub>🎨 <b>Imagen conceptual de las 12 vistas de MUZORYN.</b> Representa la organización visual y las funcionalidades de la aplicación.</sub>
 </div>
 
 ### ✨ Lo que puedes hacer
